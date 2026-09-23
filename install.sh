@@ -14,7 +14,7 @@ echo "=========================================================="
 
 # 1. Verify Python availability
 if command -v python3 >/dev/null 2>&1; then
-  PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+  PY_VER=$(python3 -c "import sys; print('{}.{}'.format(sys.version_info.major, sys.version_info.minor))")
   echo "✅ Python 3 found (v$PY_VER)"
 else
   echo "❌ Error: python3 is required but was not found in PATH." >&2
