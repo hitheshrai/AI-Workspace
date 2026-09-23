@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
 AI-Workspace Memory Manager (Zero-dependency CLI)
-Usage:
-  ai-mem init <slug>              # Initialize memory for current repo
-  ai-mem prompt [--tier 1|2|3]     # Output prompt context for any LLM
-  ai-mem status                   # Show repo and memory alignment
-  ai-mem save                     # Interactive session record generator
+Universal multi-device, multi-model agent coordination tool.
+
+Commands:
+  ai-mem status                     Show repo git status and memory alignment
+  ai-mem prompt [--tier 1|2|3]      Assemble context prompt for any LLM
+  ai-mem save                       Interactively record a dated session handoff
+  ai-mem log [-n N]                 View recent session handoffs for active repo
+  ai-mem init <slug>                Bootstrap and register memory for current repo
+  ai-mem inject <tool>              Generate tool configs (cursor, aider, claude, copilot, all)
+  ai-mem doctor                     Run workspace and project diagnostic checks
 """
 
 import sys
 import os
 import subprocess
 import datetime
-import json
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -22,32 +26,37 @@ if not PROJECTS_FILE.exists() and (WORKSPACE / "PROJECTS.md.example").exists():
     PROJECTS_FILE = WORKSPACE / "PROJECTS.md.example"
 
 
-def get_git_info():
+def get_git_info(cwd=None):
+    if cwd is None:
+        cwd = Path.cwd()
     try:
         root = subprocess.check_output(
             ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(cwd),
             universal_newlines=True,
             stderr=subprocess.DEVNULL,
         ).strip()
         commit = subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(cwd),
             universal_newlines=True,
             stderr=subprocess.DEVNULL,
         ).strip()
         branch = subprocess.check_output(
             ["git", "branch", "--show-current"],
+            cwd=str(cwd),
             universal_newlines=True,
             stderr=subprocess.DEVNULL,
         ).strip()
         return Path(root), commit, branch
     except Exception:
-        return Path.cwd(), "uncommitted", "no-git"
+        return Path(cwd), "uncommitted", "no-git"
 
 
 def resolve_project(repo_path):
     if not PROJECTS_FILE.exists():
         return None
-    with open(PROJECTS_FILE) as f:
+    with open(str(PROJECTS_FILE)) as f:
         for line in f:
             parts = [p.strip() for p in line.split("|")]
             if len(parts) >= 5 and parts[2]:
@@ -69,15 +78,18 @@ def cmd_prompt(tier=1):
     repo_path, commit, branch = get_git_info()
     proj_dir = resolve_project(repo_path)
 
-    # 1. Base Environment
+    # 1. Header
     print("<!-- AI-MEMORY-START -->")
-    print(f"Git-Context: {repo_path.name} | Branch: {branch} | Commit: {commit}")
+    print("Git-Context: {} | Branch: {} | Commit: {}".format(repo_path.name, branch, commit))
 
-    if (WORKSPACE / "GLOBAL.md").exists():
-        print(f"\n# Global Environment Rules\n{(WORKSPACE / 'GLOBAL.md').read_text().strip()}")
+    global_md = WORKSPACE / "GLOBAL.md"
+    if not global_md.exists() and (WORKSPACE / "GLOBAL.md.example").exists():
+        global_md = WORKSPACE / "GLOBAL.md.example"
+    if global_md.exists():
+        print("\n# Global Environment Rules\n{}".format(global_md.read_text().strip()))
 
     if not proj_dir or not proj_dir.exists():
-        print(f"\n[Notice: Repository {repo_path} is not registered in PROJECTS.md]")
+        print("\n[Notice: Repository {} is not registered in PROJECTS.md]".format(repo_path))
         print("<!-- AI-MEMORY-END -->\n")
         return
 
@@ -86,12 +98,12 @@ def cmd_prompt(tier=1):
     current_md = (proj_dir / "CURRENT.md").read_text().strip() if (proj_dir / "CURRENT.md").exists() else ""
     decisions_md = (proj_dir / "DECISIONS.md").read_text().strip() if (proj_dir / "DECISIONS.md").exists() else ""
 
-    if tier == 3:  # Lightweight (Local 7B/14B)
-        print(f"\n# Active Project: {proj_dir.name}\n## Immediate Context\n{current_md}")
-    elif tier == 2:  # Mid (32B/70B)
-        print(f"\n# Project Charter\n{project_md}\n\n# Current State\n{current_md}")
-    else:  # Tier 1: Full
-        print(f"\n# Project Charter\n{project_md}\n\n# Current State\n{current_md}\n\n# Key Decisions\n{decisions_md}")
+    if tier == 3:  # Fast / Edge (Local 7B/14B)
+        print("\n# Active Project: {}\n## Immediate State\n{}".format(proj_dir.name, current_md))
+    elif tier == 2:  # Mid-Weight (Local 32B/70B)
+        print("\n# Project Charter\n{}\n\n# Current State\n{}".format(project_md, current_md))
+    else:  # Tier 1: Full Frontier
+        print("\n# Project Charter\n{}\n\n# Current State\n{}\n\n# Key Decisions\n{}".format(project_md, current_md, decisions_md))
 
     print("<!-- AI-MEMORY-END -->\n")
 
@@ -100,21 +112,22 @@ def cmd_save():
     repo_path, commit, branch = get_git_info()
     proj_dir = resolve_project(repo_path)
     if not proj_dir:
-        print("Error: Current directory is not registered in PROJECTS.md")
+        print("Error: Current directory {} is not registered in PROJECTS.md".format(repo_path))
         sys.exit(1)
 
-    agent = input("Agent/Tool name (e.g. cursor, ollama, claude, script): ").strip() or "agent"
-    model = input("Model name (e.g. qwen2.5-32b, deepseek-r1, sonnet): ").strip() or "unknown"
+    print("--- Session Recording for {} ---".format(proj_dir.name))
+    agent = input("Agent/Tool (e.g. cursor, ollama, claude, aider, script) [agent]: ").strip() or "agent"
+    model = input("Model (e.g. qwen2.5-32b, deepseek-r1, sonnet, gemini) [unknown]: ").strip() or "unknown"
     task = input("Short task description: ").strip().replace(" ", "-").lower() or "session"
 
     timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    session_id = f"{timestamp}-{agent}-{task}"
-    session_file = proj_dir / "sessions" / f"{session_id}.md"
+    session_id = "{}-{}-{}".format(timestamp, agent, task)
+    session_file = proj_dir / "sessions" / "{}.md".format(session_id)
 
-    template = f"""---
-project: {proj_dir.name}
+    template = """---
+project: {project}
 session_id: {session_id}
-date: {datetime.date.today().isoformat()}
+date: {date}
 agent: {agent}
 model: {model}
 branch: {branch}
@@ -122,53 +135,281 @@ commit: {commit}
 status: completed
 ---
 
-# {task.replace('-', ' ').title()}
+# {title}
 
 ## Requested
-<!-- What was requested -->
+<!-- What the user or pipeline requested -->
 
 ## Work Completed
-<!-- Bulleted list of actions -->
+<!-- Concrete actions, code changes, refactors -->
 
 ## Verification & Tests
-<!-- Evidence: test outputs, benchmarks, logs -->
+<!-- Evidence: command outputs, test assertions, benchmark logs -->
 
-## Next Steps
-<!-- The exact next action to continue -->
-"""
+## Decisions Made
+<!-- Architectural or durable choices to copy to DECISIONS.md -->
+
+## Next Step
+<!-- The smallest useful next action -->
+""".format(
+        project=proj_dir.name,
+        session_id=session_id,
+        date=datetime.date.today().isoformat(),
+        agent=agent,
+        model=model,
+        branch=branch,
+        commit=commit,
+        title=task.replace("-", " ").title(),
+    )
+
     proj_dir.joinpath("sessions").mkdir(parents=True, exist_ok=True)
     session_file.write_text(template)
-    print(f"\n✅ Session handoff drafted at: {session_file}")
-    print(f"👉 Edit this file, record your findings, and update {proj_dir}/CURRENT.md")
+    print("\n✅ Session handoff drafted: {}".format(session_file))
+    print("👉 Edit this file to record details, and update {}/CURRENT.md".format(proj_dir))
+
+
+def cmd_log(n=5):
+    repo_path, commit, branch = get_git_info()
+    proj_dir = resolve_project(repo_path)
+    if not proj_dir:
+        print("Error: Current directory is not registered in PROJECTS.md")
+        sys.exit(1)
+
+    sessions_dir = proj_dir / "sessions"
+    if not sessions_dir.exists():
+        print("No sessions directory found in {}".format(proj_dir))
+        return
+
+    session_files = sorted(sessions_dir.glob("*.md"), reverse=True)
+    if not session_files:
+        print("No session records found for {}.".format(proj_dir.name))
+        return
+
+    print("Recent {} sessions for {}:".format(min(n, len(session_files)), proj_dir.name))
+    print("-" * 75)
+    for sfile in session_files[:n]:
+        agent, model, date, status = "unknown", "unknown", "unknown", "unknown"
+        title = sfile.stem
+        try:
+            with open(str(sfile)) as f:
+                lines = f.readlines()
+                in_frontmatter = False
+                for line in lines:
+                    line_s = line.strip()
+                    if line_s == "---":
+                        in_frontmatter = not in_frontmatter
+                        continue
+                    if in_frontmatter and ":" in line_s:
+                        k, v = line_s.split(":", 1)
+                        k, v = k.strip(), v.strip()
+                        if k == "agent": agent = v
+                        elif k == "model": model = v
+                        elif k == "date": date = v
+                        elif k == "status": status = v
+                    elif not in_frontmatter and line_s.startswith("# "):
+                        title = line_s[2:].strip()
+                        break
+        except Exception:
+            pass
+        print("📅 {} | 🤖 {:<10} | 🧠 {:<15} | ✅ {:<10}".format(date, agent, model, status))
+        print("   Task: {} ({})".format(title, sfile.name))
+        print("-" * 75)
 
 
 def cmd_status():
     repo_path, commit, branch = get_git_info()
     proj_dir = resolve_project(repo_path)
-    print(f"Repository: {repo_path}")
-    print(f"Git: Branch={branch}, Commit={commit}")
+    print("==========================================================")
+    print("            AI-Workspace Memory Alignment Check           ")
+    print("==========================================================")
+    print("Repository Path:  {}".format(repo_path))
+    print("Git Context:      Branch={}, Commit={}".format(branch, commit))
+
     if proj_dir and proj_dir.exists():
-        print(f"Memory Directory: {proj_dir}")
-        print("Registered in PROJECTS.md: YES")
+        print("Memory Directory: {}".format(proj_dir))
+        print("Status:           REGISTERED & ACTIVE")
         current_md = proj_dir / "CURRENT.md"
         if current_md.exists():
-            for line in current_md.read_text().splitlines()[:5]:
-                print(f"  {line}")
+            print("\nPreview of CURRENT.md:")
+            for line in current_md.read_text().splitlines()[:6]:
+                print("  {}".format(line))
+        session_count = len(list((proj_dir / "sessions").glob("*.md"))) if (proj_dir / "sessions").exists() else 0
+        print("\nRecorded Sessions: {}".format(session_count))
     else:
-        print(f"Memory Directory: Not registered or missing")
+        print("Memory Directory: NOT REGISTERED")
+        print("\nRun 'ai-mem init <slug>' to link this repository to the memory hub.")
+    print("==========================================================")
+
+
+def cmd_init(slug):
+    repo_path, _, _ = get_git_info()
+    target_dir = WORKSPACE / "projects" / slug
+    if target_dir.exists():
+        print("Error: Memory directory {} already exists.".format(target_dir))
+        sys.exit(1)
+
+    templates_dir = WORKSPACE / "templates"
+    target_dir.joinpath("sessions").mkdir(parents=True, exist_ok=True)
+
+    for doc in ["PROJECT.md", "CURRENT.md", "DECISIONS.md", "EXPERIMENTS.md"]:
+        src = templates_dir / doc
+        dst = target_dir / doc
+        if src.exists():
+            content = src.read_text()
+            content = content.replace("/absolute/path", str(repo_path))
+            content = content.replace("YYYY-MM-DD", datetime.date.today().isoformat())
+            dst.write_text(content)
+
+    # Register in PROJECTS.md if not already present
+    projects_file = WORKSPACE / "PROJECTS.md"
+    entry = "| {} | {} | projects/{} | Active |\n".format(slug.replace("-", " ").title(), repo_path, slug)
+    if projects_file.exists():
+        text = projects_file.read_text()
+        if str(repo_path) not in text:
+            with open(str(projects_file), "a") as f:
+                f.write(entry)
+            print("✅ Registered {} in {}".format(slug, projects_file))
+    print("✅ Initialized memory directory: {}".format(target_dir))
+
+
+def cmd_inject(tool):
+    repo_path, _, _ = get_git_info()
+    proj_dir = resolve_project(repo_path)
+    if not proj_dir:
+        print("Error: Must be in a registered repository to inject tool configurations.")
+        sys.exit(1)
+
+    tools = ["cursor", "aider", "claude", "copilot"] if tool == "all" else [tool]
+
+    if "cursor" in tools:
+        rules_dir = repo_path / ".cursor" / "rules"
+        rules_dir.mkdir(parents=True, exist_ok=True)
+        rule_file = rules_dir / "agent-memory.mdc"
+        rule_file.write_text(
+            "---\ndescription: Agent memory workflow\nglobs: *\n---\n"
+            "# Shared Agent Memory\n"
+            "Always read `{current_md}` before modifying files.\n"
+            "Follow the universal rules in `~/AGENTS.md`.\n"
+            "When done, run `ai-mem save` to record the session.\n".format(
+                current_md=proj_dir / "CURRENT.md"
+            )
+        )
+        print("✅ Injected Cursor rule: {}".format(rule_file))
+
+    if "aider" in tools:
+        aider_conf = repo_path / ".aider.conf.yml"
+        content = "read:\n  - ~/AGENTS.md\n  - {}\n".format(proj_dir / "CURRENT.md")
+        aider_conf.write_text(content)
+        print("✅ Injected Aider configuration: {}".format(aider_conf))
+
+    if "claude" in tools:
+        claude_md = repo_path / "CLAUDE.md"
+        content = (
+            "# Claude Entry Point\n\n"
+            "Follow `~/AGENTS.md` and the memory workflow.\n"
+            "Read `{current_md}` before acting.\n"
+        ).format(current_md=proj_dir / "CURRENT.md")
+        claude_md.write_text(content)
+        print("✅ Injected Claude entrypoint: {}".format(claude_md))
+
+    if "copilot" in tools:
+        copilot_dir = repo_path / ".github"
+        copilot_dir.mkdir(parents=True, exist_ok=True)
+        copilot_file = copilot_dir / "copilot-instructions.md"
+        content = (
+            "# GitHub Copilot Instructions\n\n"
+            "Follow `~/AGENTS.md`.\n"
+            "Consult `{current_md}` for active architecture state and ongoing goals.\n"
+        ).format(current_md=proj_dir / "CURRENT.md")
+        copilot_file.write_text(content)
+        print("✅ Injected Copilot instructions: {}".format(copilot_file))
+
+
+def cmd_doctor():
+    print("==========================================================")
+    print("               AI-Workspace Doctor Diagnostic             ")
+    print("==========================================================")
+    errors = 0
+    warnings = 0
+
+    # 1. Check workspace
+    if WORKSPACE.exists():
+        print("✅ Workspace directory: {}".format(WORKSPACE))
+    else:
+        print("❌ Workspace directory missing: {}".format(WORKSPACE))
+        errors += 1
+
+    # 2. Check universal AGENTS.md
+    home_agents = Path.home() / "AGENTS.md"
+    if home_agents.exists():
+        print("✅ Universal agent rules: {}".format(home_agents))
+    else:
+        print("⚠️  Warning: ~/AGENTS.md not found. Run ./install.sh or copy templates/AGENTS.md")
+        warnings += 1
+
+    # 3. Check PROJECTS.md
+    if PROJECTS_FILE.exists():
+        with open(str(PROJECTS_FILE)) as f:
+            count = sum(1 for l in f if l.strip().startswith("|") and not l.strip().startswith("| Project") and not l.strip().startswith("|---"))
+        print("✅ Projects registry: {} ({} projects registered)".format(PROJECTS_FILE.name, count))
+    else:
+        print("❌ PROJECTS.md missing in {}".format(WORKSPACE))
+        errors += 1
+
+    # 4. Check Current Repo
+    repo_path, commit, branch = get_git_info()
+    print("\n--- Current Directory Check ---")
+    print("Directory: {}".format(repo_path))
+    if branch != "no-git":
+        print("✅ Git repository detected (Branch={}, Commit={})".format(branch, commit))
+    else:
+        print("ℹ️  Not a git repository.")
+
+    proj_dir = resolve_project(repo_path)
+    if proj_dir and proj_dir.exists():
+        print("✅ Registered project memory: {}".format(proj_dir))
+        for req in ["PROJECT.md", "CURRENT.md", "DECISIONS.md"]:
+            if (proj_dir / req).exists():
+                print("   ✅ {}".format(req))
+            else:
+                print("   ⚠️  Missing {}".format(req))
+                warnings += 1
+    else:
+        print("ℹ️  Directory is not registered in PROJECTS.md.")
+
+    print("\nDiagnostic complete: {} error(s), {} warning(s).".format(errors, warnings))
+    print("==========================================================")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2 or sys.argv[1] == "prompt":
+    args = sys.argv[1:]
+    if not args or args[0] == "prompt":
         tier = 1
-        if "--tier" in sys.argv:
-            idx = sys.argv.index("--tier")
-            if idx + 1 < len(sys.argv):
-                tier = int(sys.argv[idx + 1])
+        if "--tier" in args:
+            idx = args.index("--tier")
+            if idx + 1 < len(args):
+                tier = int(args[idx + 1])
         cmd_prompt(tier)
-    elif sys.argv[1] == "save":
-        cmd_save()
-    elif sys.argv[1] == "status":
+    elif args[0] == "status":
         cmd_status()
+    elif args[0] == "save":
+        cmd_save()
+    elif args[0] == "log":
+        n = 5
+        if "-n" in args:
+            idx = args.index("-n")
+            if idx + 1 < len(args):
+                n = int(args[idx + 1])
+        cmd_log(n)
+    elif args[0] == "init":
+        if len(args) < 2:
+            print("Usage: ai-mem init <project-slug>")
+            sys.exit(1)
+        cmd_init(args[1])
+    elif args[0] == "inject":
+        tool = args[1] if len(args) > 1 else "all"
+        cmd_inject(tool)
+    elif args[0] == "doctor":
+        cmd_doctor()
     else:
-        print("Usage: ai-mem [prompt [--tier 1|2|3] | save | status]")
+        print("Usage: ai-mem [status | prompt [--tier 1|2|3] | save | log [-n N] | init <slug> | inject <tool> | doctor]")
