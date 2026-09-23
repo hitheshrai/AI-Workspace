@@ -1,0 +1,178 @@
+#!/home/hraipuru/mambaforge/bin/python
+# System python3 on this login node is 3.6 (argparse lacks subparsers
+# `required=`); use the Mambaforge 3.10 interpreter, per AI-Workspace/pilot
+# convention.
+"""ASU RC Voyager (openai.rc.asu.edu) LLM gateway client.
+
+Purpose: offload token-cheap, non-sensitive work (bulk text processing,
+drafting, routine coding subtasks) from Claude Code's own budget, per
+AI-Workspace/MODEL_ROUTING.md. Stdlib-only (no pip/conda install needed).
+
+Credentials: reads OPENAI_API_KEY from the environment if set, otherwise
+falls back to the key stored in TOKEN_FILE below (owner-only permissions
+required). To set the env var instead, in your own shell:
+
+    read -rs OPENAI_API_KEY
+    export OPENAI_API_KEY
+    export OPENAI_BASE_URL="https://openai.rc.asu.edu/v1"
+
+Data-governance note: this is a network call to an external host from the
+login node's perspective. Per AI-Workspace/MODEL_ROUTING.md, do not pipe
+`local-only`-classified project data through this tool unless that
+project's PROJECT.md explicitly records Voyager as an approved cloud
+provider.
+"""
+import argparse
+import json
+import os
+import stat
+import sys
+import urllib.error
+import urllib.request
+
+TOKEN_FILE = os.path.expanduser("~/API/.rc_voyager_token")
+
+# Role presets, picked from the Voyager production catalog (2026-09-20):
+# avoid models tagged "Testing in progress" as defaults, prefer ones with
+# either proven usage history or solid LiveBench scores for the task shape.
+ROLE_MODELS = {
+    # bulk/repetitive text work, drafting, general chat — already this
+    # account's proven workhorse (7.7M of prior usage)
+    "general": "qwen3-235b-a22b-instruct-2507",
+    # general coding subtasks — flagship coding model, repo-scale/multi-file,
+    # highest LiveBench coding score in the catalog (82.5)
+    "coding": "glm-5-2",
+    # VASP/HPC automation (parsing OUTCAR, generating inputs) — reasoning +
+    # coding + data-analysis tags, efficient MoE, LiveBench 76.2
+    "vasp": "qwen3-30b-a3b-thinking-2507",
+}
+DEFAULT_BASE_URL = "https://openai.rc.asu.edu/v1"
+DEFAULT_MODEL = os.environ.get("VOYAGER_MODEL", ROLE_MODELS["general"])
+
+
+def die(msg, code=1):
+    print(f"voyager: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def base_url():
+    return os.environ.get("OPENAI_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+
+
+def api_key():
+    key = os.environ.get("OPENAI_API_KEY")
+    if key:
+        return key
+    if os.path.isfile(TOKEN_FILE):
+        mode = stat.S_IMODE(os.stat(TOKEN_FILE).st_mode)
+        if mode & (stat.S_IRWXG | stat.S_IRWXO):
+            die(
+                f"{TOKEN_FILE} is group/world-accessible (mode {oct(mode)}) "
+                f"on a shared login node; refusing to read it as a credential. "
+                f"Fix with: chmod 600 {TOKEN_FILE}"
+            )
+        with open(TOKEN_FILE) as f:
+            key = f.read().strip()
+        if key:
+            return key
+    if not key:
+        die(
+            f"No API key found. Either export OPENAI_API_KEY, or place it in "
+            f"{TOKEN_FILE} (owner-only permissions). To set the env var:\n"
+            "  read -rs OPENAI_API_KEY\n"
+            "  export OPENAI_API_KEY\n"
+            "  export OPENAI_BASE_URL=\"https://openai.rc.asu.edu/v1\""
+        )
+    return key
+
+
+def request(path, payload=None, method="GET"):
+    url = f"{base_url()}/{path.lstrip('/')}"
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {api_key()}")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        die(f"HTTP {e.code} from {url}: {body}")
+    except urllib.error.URLError as e:
+        die(f"connection error reaching {url}: {e.reason}")
+
+
+def cmd_models(args):
+    data = request("models", method="GET")
+    for m in data.get("data", []):
+        print(m.get("id"))
+
+
+def cmd_chat(args):
+    if args.file:
+        with open(args.file) as f:
+            content = f.read()
+    elif args.prompt:
+        content = args.prompt
+    else:
+        content = sys.stdin.read()
+    if not content.strip():
+        die("no input: pass a prompt argument, --file, or pipe stdin")
+
+    messages = []
+    if args.system:
+        messages.append({"role": "system", "content": args.system})
+    messages.append({"role": "user", "content": content})
+
+    model = args.model or ROLE_MODELS.get(args.role, DEFAULT_MODEL)
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": args.temperature,
+    }
+    data = request("chat/completions", payload, method="POST")
+    try:
+        print(data["choices"][0]["message"]["content"])
+    except (KeyError, IndexError):
+        die(f"unexpected response shape: {json.dumps(data)[:500]}")
+    if args.usage:
+        print(f"--- usage: {data.get('usage')}", file=sys.stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="voyager", description="ASU RC Voyager LLM gateway CLI"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_models = sub.add_parser("models", help="list available model ids")
+    p_models.set_defaults(func=cmd_models)
+
+    p_chat = sub.add_parser("chat", help="send a chat completion request")
+    p_chat.add_argument(
+        "prompt", nargs="?", help="prompt text (omit to use --file or stdin)"
+    )
+    p_chat.add_argument("-f", "--file", help="read prompt content from file")
+    p_chat.add_argument(
+        "-m", "--model", default=None, help="explicit model id (overrides --role)"
+    )
+    p_chat.add_argument(
+        "-r",
+        "--role",
+        choices=sorted(ROLE_MODELS),
+        default="general",
+        help=f"role preset selecting a model (default: general -> {ROLE_MODELS['general']})",
+    )
+    p_chat.add_argument("-s", "--system", help="system prompt")
+    p_chat.add_argument("-t", "--temperature", type=float, default=0.3)
+    p_chat.add_argument(
+        "--usage", action="store_true", help="print token usage to stderr"
+    )
+    p_chat.set_defaults(func=cmd_chat)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

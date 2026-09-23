@@ -1,0 +1,13 @@
+# Project Registry
+
+Match the current working directory to the longest repository-path prefix. Paths in this file are authoritative pointers; code is not copied into this workspace.
+
+| Project | Repository path | Memory directory | State |
+|---|---|---|---|
+| AI Workspace Memory | `/path/to/AI-Workspace` | `projects/ai-workspace` | Active |
+| Example Project | `/path/to/my-repo` | `projects/my-repo` | Active |
+
+## Registry rules
+- One row per project; do not register individual sessions as projects.
+- Use absolute repository paths and workspace-relative memory directories.
+- Unregistered directories have no assumed project memory.

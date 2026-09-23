@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 2 ]]; then
+  echo "Usage: $0 PROJECT_SLUG /absolute/repository/path" >&2
+  exit 2
+fi
+
+project_slug=$1
+repository_path=$2
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+workspace_dir="${AI_WORKSPACE_DIR:-$(dirname "$SCRIPT_DIR")}"
+target_dir="$workspace_dir/projects/$project_slug"
+
+if [[ ! "$project_slug" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+  echo "PROJECT_SLUG must contain only lowercase letters, digits, and hyphens." >&2
+  exit 2
+fi
+
+if [[ "$repository_path" != /* || ! -d "$repository_path" ]]; then
+  echo "Repository path must be an existing absolute directory." >&2
+  exit 2
+fi
+
+if [[ -e "$target_dir" ]]; then
+  echo "Refusing to overwrite existing memory: $target_dir" >&2
+  exit 1
+fi
+
+mkdir -p "$target_dir/sessions"
+cp "$workspace_dir/templates/PROJECT.md" "$target_dir/PROJECT.md"
+cp "$workspace_dir/templates/CURRENT.md" "$target_dir/CURRENT.md"
+cp "$workspace_dir/templates/DECISIONS.md" "$target_dir/DECISIONS.md"
+cp "$workspace_dir/templates/ARCHITECTURE.md" "$target_dir/ARCHITECTURE.md"
+cp "$workspace_dir/templates/EXPERIMENTS.md" "$target_dir/EXPERIMENTS.md"
+cp "$workspace_dir/templates/GLOSSARY.md" "$target_dir/GLOSSARY.md"
+
+escaped_repository_path=${repository_path//&/\\&}
+escaped_repository_path=${escaped_repository_path//|/\\|}
+sed -i "s|/absolute/path|$escaped_repository_path|" "$target_dir/PROJECT.md"
+sed -i "s/YYYY-MM-DD/$(date +%F)/" "$target_dir/PROJECT.md" "$target_dir/CURRENT.md"
+
+echo "Created $target_dir"
+echo "Next: update PROJECT.md and add the project to $workspace_dir/PROJECTS.md"

@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""
+AI-Workspace Memory Manager (Zero-dependency CLI)
+Usage:
+  ai-mem init <slug>              # Initialize memory for current repo
+  ai-mem prompt [--tier 1|2|3]     # Output prompt context for any LLM
+  ai-mem status                   # Show repo and memory alignment
+  ai-mem save                     # Interactive session record generator
+"""
+
+import sys
+import os
+import subprocess
+import datetime
+import json
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+WORKSPACE = Path(os.environ.get("AI_WORKSPACE_DIR", SCRIPT_DIR.parent))
+PROJECTS_FILE = WORKSPACE / "PROJECTS.md"
+if not PROJECTS_FILE.exists() and (WORKSPACE / "PROJECTS.md.example").exists():
+    PROJECTS_FILE = WORKSPACE / "PROJECTS.md.example"
+
+
+def get_git_info():
+    try:
+        root = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            universal_newlines=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            universal_newlines=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        branch = subprocess.check_output(
+            ["git", "branch", "--show-current"],
+            universal_newlines=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        return Path(root), commit, branch
+    except Exception:
+        return Path.cwd(), "uncommitted", "no-git"
+
+
+def resolve_project(repo_path):
+    if not PROJECTS_FILE.exists():
+        return None
+    with open(PROJECTS_FILE) as f:
+        for line in f:
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) >= 5 and parts[2]:
+                clean_path = parts[2].strip("`").strip()
+                clean_mem = parts[3].strip("`").strip()
+                reg_path = Path(clean_path)
+                try:
+                    repo_path.relative_to(reg_path)
+                    is_rel = True
+                except ValueError:
+                    is_rel = False
+                if repo_path == reg_path or is_rel:
+                    slug = Path(clean_mem).name
+                    return WORKSPACE / "projects" / slug
+    return None
+
+
+def cmd_prompt(tier=1):
+    repo_path, commit, branch = get_git_info()
+    proj_dir = resolve_project(repo_path)
+
+    # 1. Base Environment
+    print("<!-- AI-MEMORY-START -->")
+    print(f"Git-Context: {repo_path.name} | Branch: {branch} | Commit: {commit}")
+
+    if (WORKSPACE / "GLOBAL.md").exists():
+        print(f"\n# Global Environment Rules\n{(WORKSPACE / 'GLOBAL.md').read_text().strip()}")
+
+    if not proj_dir or not proj_dir.exists():
+        print(f"\n[Notice: Repository {repo_path} is not registered in PROJECTS.md]")
+        print("<!-- AI-MEMORY-END -->\n")
+        return
+
+    # 2. Tiered context assembly
+    project_md = (proj_dir / "PROJECT.md").read_text().strip() if (proj_dir / "PROJECT.md").exists() else ""
+    current_md = (proj_dir / "CURRENT.md").read_text().strip() if (proj_dir / "CURRENT.md").exists() else ""
+    decisions_md = (proj_dir / "DECISIONS.md").read_text().strip() if (proj_dir / "DECISIONS.md").exists() else ""
+
+    if tier == 3:  # Lightweight (Local 7B/14B)
+        print(f"\n# Active Project: {proj_dir.name}\n## Immediate Context\n{current_md}")
+    elif tier == 2:  # Mid (32B/70B)
+        print(f"\n# Project Charter\n{project_md}\n\n# Current State\n{current_md}")
+    else:  # Tier 1: Full
+        print(f"\n# Project Charter\n{project_md}\n\n# Current State\n{current_md}\n\n# Key Decisions\n{decisions_md}")
+
+    print("<!-- AI-MEMORY-END -->\n")
+
+
+def cmd_save():
+    repo_path, commit, branch = get_git_info()
+    proj_dir = resolve_project(repo_path)
+    if not proj_dir:
+        print("Error: Current directory is not registered in PROJECTS.md")
+        sys.exit(1)
+
+    agent = input("Agent/Tool name (e.g. cursor, ollama, claude, script): ").strip() or "agent"
+    model = input("Model name (e.g. qwen2.5-32b, deepseek-r1, sonnet): ").strip() or "unknown"
+    task = input("Short task description: ").strip().replace(" ", "-").lower() or "session"
+
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    session_id = f"{timestamp}-{agent}-{task}"
+    session_file = proj_dir / "sessions" / f"{session_id}.md"
+
+    template = f"""---
+project: {proj_dir.name}
+session_id: {session_id}
+date: {datetime.date.today().isoformat()}
+agent: {agent}
+model: {model}
+branch: {branch}
+commit: {commit}
+status: completed
+---
+
+# {task.replace('-', ' ').title()}
+
+## Requested
+<!-- What was requested -->
+
+## Work Completed
+<!-- Bulleted list of actions -->
+
+## Verification & Tests
+<!-- Evidence: test outputs, benchmarks, logs -->
+
+## Next Steps
+<!-- The exact next action to continue -->
+"""
+    proj_dir.joinpath("sessions").mkdir(parents=True, exist_ok=True)
+    session_file.write_text(template)
+    print(f"\n✅ Session handoff drafted at: {session_file}")
+    print(f"👉 Edit this file, record your findings, and update {proj_dir}/CURRENT.md")
+
+
+def cmd_status():
+    repo_path, commit, branch = get_git_info()
+    proj_dir = resolve_project(repo_path)
+    print(f"Repository: {repo_path}")
+    print(f"Git: Branch={branch}, Commit={commit}")
+    if proj_dir and proj_dir.exists():
+        print(f"Memory Directory: {proj_dir}")
+        print("Registered in PROJECTS.md: YES")
+        current_md = proj_dir / "CURRENT.md"
+        if current_md.exists():
+            for line in current_md.read_text().splitlines()[:5]:
+                print(f"  {line}")
+    else:
+        print(f"Memory Directory: Not registered or missing")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] == "prompt":
+        tier = 1
+        if "--tier" in sys.argv:
+            idx = sys.argv.index("--tier")
+            if idx + 1 < len(sys.argv):
+                tier = int(sys.argv[idx + 1])
+        cmd_prompt(tier)
+    elif sys.argv[1] == "save":
+        cmd_save()
+    elif sys.argv[1] == "status":
+        cmd_status()
+    else:
+        print("Usage: ai-mem [prompt [--tier 1|2|3] | save | status]")

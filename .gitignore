@@ -1,0 +1,29 @@
+# -------------------------------------------------------------
+# AI-Workspace Gitignore
+# Keep the framework, templates, and tooling public/portable.
+# Never commit project memory, lab notes, raw data, or secrets.
+# -------------------------------------------------------------
+
+# Active project memory & session records
+projects/
+archive/
+pilot/
+
+# Local machine-specific registry & environment (use .example files)
+GLOBAL.md
+PROJECTS.md
+
+# Secrets and tokens
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+
+# Python & OS artifacts
+__pycache__/
+*.py[cod]
+.DS_Store
+*.log

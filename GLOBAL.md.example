@@ -1,0 +1,13 @@
+# Global Context
+
+## Environment
+- Primary workspace root: $HOME
+- Shell: Bash / Zsh
+- Host: Local Workstation (CPU, GPU, RAM)
+
+## General working rules
+- Preserve existing work and inspect repository status before editing.
+- Prefer reproducible commands, tracked configuration, and verifiable results.
+- Validate conclusions against primary files, tests, data, or scheduler state.
+- Keep project-specific assumptions inside that project's memory.
+- Keep secrets, tokens, and restricted data out of prompts, memory files, and Git.
