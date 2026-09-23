@@ -8,6 +8,10 @@ Commands:
   ai-mem prompt [--tier 1|2|3]      Assemble context prompt for any LLM
   ai-mem save                       Interactively record a dated session handoff
   ai-mem log [-n N]                 View recent session handoffs for active repo
+  ai-mem map                        AST & structural code mapping -> ARCHITECTURE.md
+  ai-mem lock <workstream>          Register active workstream to prevent collisions
+  ai-mem unlock <workstream>        Clear active workstream from CURRENT.md
+  ai-mem compact [--keep N]         Archive older sessions to prevent context rot
   ai-mem init <slug>                Bootstrap and register memory for current repo
   ai-mem inject <tool>              Generate tool configs (cursor, aider, claude, copilot, all)
   ai-mem doctor                     Run workspace and project diagnostic checks
@@ -17,6 +21,8 @@ import sys
 import os
 import subprocess
 import datetime
+import re
+import ast
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -24,6 +30,21 @@ WORKSPACE = Path(os.environ.get("AI_WORKSPACE_DIR", SCRIPT_DIR.parent))
 PROJECTS_FILE = WORKSPACE / "PROJECTS.md"
 if not PROJECTS_FILE.exists() and (WORKSPACE / "PROJECTS.md.example").exists():
     PROJECTS_FILE = WORKSPACE / "PROJECTS.md.example"
+
+# Privacy patterns for sanitization boundary
+SECRET_PATTERNS = [
+    (re.compile(r"sk-[a-zA-Z0-9]{20,}"), "[REDACTED_OPENAI_KEY]"),
+    (re.compile(r"ghp_[a-zA-Z0-9]{20,}"), "[REDACTED_GITHUB_TOKEN]"),
+    (re.compile(r"Bearer\s+[a-zA-Z0-9\._\-]{20,}"), "Bearer [REDACTED_TOKEN]"),
+    (re.compile(r"-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+ PRIVATE KEY-----"), "[REDACTED_PRIVATE_KEY]"),
+    (re.compile(r"(api[_-]?key\s*[:=]\s*['\"][a-zA-Z0-9_\-]{16,}['\"])", re.IGNORECASE), "api_key=[REDACTED]"),
+]
+
+
+def sanitize_text(text):
+    for pattern, replacement in SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 def get_git_info(cwd=None):
@@ -163,7 +184,8 @@ status: completed
     )
 
     proj_dir.joinpath("sessions").mkdir(parents=True, exist_ok=True)
-    session_file.write_text(template)
+    clean_template = sanitize_text(template)
+    session_file.write_text(clean_template)
     print("\n✅ Session handoff drafted: {}".format(session_file))
     print("👉 Edit this file to record details, and update {}/CURRENT.md".format(proj_dir))
 
@@ -216,6 +238,154 @@ def cmd_log(n=5):
         print("-" * 75)
 
 
+def cmd_compact(keep=5):
+    """Inspired by ai-memory: decay/archive older cold sessions to prevent context rot."""
+    repo_path, _, _ = get_git_info()
+    proj_dir = resolve_project(repo_path)
+    if not proj_dir:
+        print("Error: Must be in a registered repository.")
+        sys.exit(1)
+
+    sessions_dir = proj_dir / "sessions"
+    archive_dir = sessions_dir / "archive"
+    if not sessions_dir.exists():
+        print("No sessions directory found.")
+        return
+
+    all_sessions = sorted(sessions_dir.glob("*.md"), reverse=True)
+    if len(all_sessions) <= keep:
+        print("✅ Session count ({}) <= threshold ({}). No compaction needed.".format(len(all_sessions), keep))
+        return
+
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archived_count = 0
+    for sfile in all_sessions[keep:]:
+        dst = archive_dir / sfile.name
+        sfile.rename(dst)
+        archived_count += 1
+
+    print("==========================================================")
+    print("              AI-Workspace Memory Compaction              ")
+    print("==========================================================")
+    print("Project:           {}".format(proj_dir.name))
+    print("Active Sessions:   {} (kept in {})".format(keep, sessions_dir))
+    print("Archived Sessions: {} (moved to {})".format(archived_count, archive_dir))
+    print("✅ Context rot mitigated: active sessions directory is clean.")
+    print("==========================================================")
+
+
+def cmd_lock(workstream, agent="agent", scope="active work"):
+    """Inspired by jumbocontext: register active workstream to prevent multi-agent collision."""
+    repo_path, commit, branch = get_git_info()
+    proj_dir = resolve_project(repo_path)
+    if not proj_dir:
+        print("Error: Must be in a registered repository.")
+        sys.exit(1)
+
+    current_file = proj_dir / "CURRENT.md"
+    if not current_file.exists():
+        print("Error: CURRENT.md not found in {}".format(proj_dir))
+        sys.exit(1)
+
+    content = current_file.read_text()
+    lock_entry = "| {} | {} | {} | {} | {} | In-Progress |\n".format(
+        workstream, datetime.date.today().isoformat(), agent, branch, scope
+    )
+
+    if workstream in content:
+        print("⚠️  Workstream '{}' is already registered in CURRENT.md.".format(workstream))
+        return
+
+    # Check for active workstreams table
+    if "## Active workstreams" in content:
+        content = content.replace("## Active workstreams\n", "## Active workstreams\n" + lock_entry)
+    elif "## Active Workstreams" in content:
+        content = content.replace("## Active Workstreams\n", "## Active Workstreams\n" + lock_entry)
+    else:
+        content += "\n## Active Workstreams\n| Workstream | Date | Agent | Branch | Scope | Status |\n|---|---|---|---|---|---|\n" + lock_entry
+
+    current_file.write_text(content)
+    print("🔒 Concurrency Lock Acquired: Registered '{}' in {}/CURRENT.md".format(workstream, proj_dir.name))
+
+
+def cmd_unlock(workstream):
+    """Clear active workstream from CURRENT.md."""
+    repo_path, _, _ = get_git_info()
+    proj_dir = resolve_project(repo_path)
+    if not proj_dir:
+        print("Error: Must be in a registered repository.")
+        sys.exit(1)
+
+    current_file = proj_dir / "CURRENT.md"
+    if not current_file.exists():
+        return
+
+    lines = current_file.read_text().splitlines()
+    new_lines = [l for l in lines if not (l.strip().startswith("|") and workstream in l)]
+    current_file.write_text("\n".join(new_lines) + "\n")
+    print("🔓 Concurrency Lock Released: Removed '{}' from {}/CURRENT.md".format(workstream, proj_dir.name))
+
+
+def cmd_map():
+    """Inspired by graphify: deterministic AST & structural codebase scanner -> ARCHITECTURE.md."""
+    repo_path, commit, branch = get_git_info()
+    proj_dir = resolve_project(repo_path)
+    if not proj_dir:
+        print("Error: Must be in a registered repository to map codebase.")
+        sys.exit(1)
+
+    print("Mapping codebase in: {} ...".format(repo_path))
+    ignore_dirs = {".git", "node_modules", "__pycache__", "venv", ".venv", "dist", "build", ".next", ".cache", "target"}
+
+    file_summary = {}
+    py_symbols = {}
+
+    for root, dirs, files in os.walk(str(repo_path)):
+        dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
+        for f in files:
+            if f.startswith("."): continue
+            ext = os.path.splitext(f)[1].lower()
+            rel_file = os.path.relpath(os.path.join(root, f), str(repo_path))
+            file_summary[ext] = file_summary.get(ext, 0) + 1
+
+            if ext == ".py":
+                full_path = os.path.join(root, f)
+                try:
+                    with open(full_path, "r", encoding="utf-8", errors="ignore") as py_f:
+                        tree = ast.parse(py_f.read(), filename=f)
+                        classes = [n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
+                        functions = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and not n.name.startswith("_")]
+                        if classes or functions:
+                            py_symbols[rel_file] = {"classes": classes, "functions": functions[:10]}
+                except Exception:
+                    pass
+
+    # Build clean ARCHITECTURE.md
+    arch_file = proj_dir / "ARCHITECTURE.md"
+    output = []
+    output.append("# Architecture & Codebase Map")
+    output.append("\nLast updated: {} | Commit: {} | Branch: {}".format(datetime.date.today().isoformat(), commit, branch))
+    output.append("\n## File Inventory by Type")
+    for ext, count in sorted(file_summary.items(), key=lambda x: -x[1])[:10]:
+        display_ext = ext if ext else "[no-extension]"
+        output.append("- `{}`: {} files".format(display_ext, count))
+
+    if py_symbols:
+        output.append("\n## Python Module & Symbol Map (AST-Derived)")
+        for pfile, syms in sorted(py_symbols.items())[:30]:
+            output.append("### `{}`".format(pfile))
+            if syms["classes"]:
+                output.append("- **Classes**: `{}`".format("`, `".join(syms["classes"])))
+            if syms["functions"]:
+                output.append("- **Functions**: `{}`".format("`, `".join(syms["functions"])))
+            output.append("")
+
+    output.append("\n---\n*Generated deterministically by `ai-mem map` (zero LLM token spend, no vector store required).*")
+
+    arch_file.write_text("\n".join(output) + "\n")
+    print("✅ Deterministic Codebase Map written to: {}".format(arch_file))
+
+
 def cmd_status():
     repo_path, commit, branch = get_git_info()
     proj_dir = resolve_project(repo_path)
@@ -234,7 +404,8 @@ def cmd_status():
             for line in current_md.read_text().splitlines()[:6]:
                 print("  {}".format(line))
         session_count = len(list((proj_dir / "sessions").glob("*.md"))) if (proj_dir / "sessions").exists() else 0
-        print("\nRecorded Sessions: {}".format(session_count))
+        archive_count = len(list((proj_dir / "sessions" / "archive").glob("*.md"))) if (proj_dir / "sessions" / "archive").exists() else 0
+        print("\nSessions: {} active, {} archived".format(session_count, archive_count))
     else:
         print("Memory Directory: NOT REGISTERED")
         print("\nRun 'ai-mem init <slug>' to link this repository to the memory hub.")
@@ -401,6 +572,21 @@ if __name__ == "__main__":
             if idx + 1 < len(args):
                 n = int(args[idx + 1])
         cmd_log(n)
+    elif args[0] == "map":
+        cmd_map()
+    elif args[0] == "lock":
+        ws = args[1] if len(args) > 1 else "active-session"
+        cmd_lock(ws)
+    elif args[0] == "unlock":
+        ws = args[1] if len(args) > 1 else "active-session"
+        cmd_unlock(ws)
+    elif args[0] == "compact":
+        k = 5
+        if "--keep" in args:
+            idx = args.index("--keep")
+            if idx + 1 < len(args):
+                k = int(args[idx + 1])
+        cmd_compact(k)
     elif args[0] == "init":
         if len(args) < 2:
             print("Usage: ai-mem init <project-slug>")
@@ -412,4 +598,4 @@ if __name__ == "__main__":
     elif args[0] == "doctor":
         cmd_doctor()
     else:
-        print("Usage: ai-mem [status | prompt [--tier 1|2|3] | save | log [-n N] | init <slug> | inject <tool> | doctor]")
+        print("Usage: ai-mem [status | prompt [--tier 1|2|3] | save | log [-n N] | map | lock <name> | unlock <name> | compact [--keep N] | init <slug> | inject <tool> | doctor]")

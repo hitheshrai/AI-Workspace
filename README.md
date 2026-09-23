@@ -72,18 +72,38 @@ ai-mem inject copilot    # Generates .github/copilot-instructions.md
 * **With Claude Code / Gemini CLI**:
   Start the CLI in your repository; it automatically picks up `~/AGENTS.md` and `CURRENT.md`.
 
-### 4. Viewing Past Session Handoffs
+### 4. Deterministic AST Codebase Mapping (Zero LLM Spend)
+Generate or refresh `ARCHITECTURE.md` using deterministic AST structural parsing:
+```bash
+ai-mem map
+```
+This extracts file inventory and Python symbols (classes, functions) without spending any tokens or querying a vector store.
+
+### 5. Multi-Agent Concurrency Locking
+Prevent agent collisions across concurrent instances or different devices:
+```bash
+# Acquire lock before active editing
+ai-mem lock "feature-auth"
+
+# Release lock when done
+ai-mem unlock "feature-auth"
+```
+
+### 6. Viewing Past Session Handoffs
 Review recent sessions and model contributions right from your terminal:
 ```bash
 ai-mem log -n 5
 ```
 
-### 5. Ending a Session
+### 7. Ending a Session & Compacting Memory
 Instruct your agent to *"Save the session"* or run:
 ```bash
 ai-mem save
 ```
-This interactively drafts a structured session record capturing the Git commit, branch, actions taken, verification results, and next steps.
+To mitigate context-rot and keep session history snappy, automatically archive older sessions:
+```bash
+ai-mem compact --keep 5
+```
 
 ---
 
@@ -95,9 +115,13 @@ This interactively drafts a structured session record capturing the Git commit, 
 | `ai-mem status` | Displays active repository Git status and memory alignment side by side. |
 | `ai-mem init <slug>` | Scaffolds and registers memory for the current repository in one step. |
 | `ai-mem inject <tool>` | Injects tool configurations (`cursor`, `aider`, `claude`, `copilot`, `all`). |
+| `ai-mem map` | Generates deterministic `ARCHITECTURE.md` using AST structural parsing (zero token spend). |
+| `ai-mem lock <name>` | Registers active workstream in `CURRENT.md` to prevent multi-agent collisions. |
+| `ai-mem unlock <name>` | Releases workstream lock from `CURRENT.md`. |
 | `ai-mem prompt [--tier N]` | Generates tiered context prompt (`--tier 1|2|3`) for piping into any LLM. |
 | `ai-mem log [-n N]` | Displays a clean summary table of the last $N$ sessions for the active repo. |
 | `ai-mem save` | Interactively scaffolds a dated session handoff in `projects/<slug>/sessions/`. |
+| `ai-mem compact [--keep N]` | Moves older cold sessions to `sessions/archive/` to prevent context rot. |
 
 ---
 
