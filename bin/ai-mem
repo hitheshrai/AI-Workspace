@@ -23,13 +23,26 @@ import subprocess
 import datetime
 import re
 import ast
+import argparse
+import fcntl
+import tempfile
+import socket
+import getpass
+from contextlib import contextmanager
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE = Path(os.environ.get("AI_WORKSPACE_DIR", SCRIPT_DIR.parent))
-PROJECTS_FILE = WORKSPACE / "PROJECTS.md"
-if not PROJECTS_FILE.exists() and (WORKSPACE / "PROJECTS.md.example").exists():
-    PROJECTS_FILE = WORKSPACE / "PROJECTS.md.example"
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+def projects_file():
+    """Prefer the local registry, falling back to the checked-in example."""
+    local = WORKSPACE / "PROJECTS.md"
+    if local.exists():
+        return local
+    example = WORKSPACE / "PROJECTS.md.example"
+    return example if example.exists() else local
 
 # Privacy patterns for sanitization boundary
 SECRET_PATTERNS = [
@@ -38,6 +51,9 @@ SECRET_PATTERNS = [
     (re.compile(r"Bearer\s+[a-zA-Z0-9\._\-]{20,}"), "Bearer [REDACTED_TOKEN]"),
     (re.compile(r"-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+ PRIVATE KEY-----"), "[REDACTED_PRIVATE_KEY]"),
     (re.compile(r"(api[_-]?key\s*[:=]\s*['\"][a-zA-Z0-9_\-]{16,}['\"])", re.IGNORECASE), "api_key=[REDACTED]"),
+    (re.compile(r"(?i)(password|passwd|secret)\s*[:=]\s*[^\s&]+"), r"\1=[REDACTED]"),
+    (re.compile(r"(?i)(https?://[^\s/:@]+:)[^\s@/]+@"), r"\1[REDACTED]@"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED_AWS_ACCESS_KEY]"),
 ]
 
 
@@ -45,6 +61,18 @@ def sanitize_text(text):
     for pattern, replacement in SECRET_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
+
+
+def safe_label(value, default, limit=64):
+    """Produce a filename/frontmatter-safe label without accepting path syntax."""
+    value = re.sub(r"\s+", "-", value.strip().lower())
+    value = re.sub(r"[^a-z0-9._-]", "-", value).strip(".-")
+    value = re.sub(r"-{2,}", "-", value)[:limit]
+    return value or default
+
+
+def default_owner():
+    return os.environ.get("AI_MEM_OWNER", "{}@{}".format(getpass.getuser(), socket.gethostname()))
 
 
 def get_git_info(cwd=None):
@@ -75,27 +103,99 @@ def get_git_info(cwd=None):
 
 
 def resolve_project(repo_path):
-    if not PROJECTS_FILE.exists():
+    """Resolve the most-specific registered repository ancestor."""
+    registry = projects_file()
+    if not registry.exists():
         return None
-    with open(str(PROJECTS_FILE)) as f:
+    matches = []
+    repo_path = Path(repo_path).resolve()
+    with open(str(registry)) as f:
         for line in f:
-            parts = [p.strip() for p in line.split("|")]
-            if len(parts) >= 5 and parts[2]:
-                clean_path = parts[2].strip("`").strip()
-                clean_mem = parts[3].strip("`").strip()
-                reg_path = Path(clean_path)
-                try:
-                    repo_path.relative_to(reg_path)
-                    is_rel = True
-                except ValueError:
-                    is_rel = False
-                if repo_path == reg_path or is_rel:
-                    slug = Path(clean_mem).name
-                    return WORKSPACE / "projects" / slug
-    return None
+            columns = [p.strip().strip("`") for p in line.strip().split("|")[1:-1]]
+            if len(columns) != 4 or columns[0] in ("Project", "---"):
+                continue
+            try:
+                registered_path = Path(columns[1]).expanduser().resolve()
+                repo_path.relative_to(registered_path)
+            except ValueError:
+                continue
+            memory_path = Path(columns[2])
+            if memory_path.is_absolute() or ".." in memory_path.parts:
+                continue
+            candidate = WORKSPACE / memory_path
+            # A registry entry is not allowed to traverse through a symlink.  Without
+            # this check, a project entry could make commands read or replace another
+            # project's memory files.
+            try:
+                candidate.relative_to(WORKSPACE / "projects")
+                if candidate.exists() and candidate.resolve() != candidate.absolute():
+                    continue
+            except ValueError:
+                continue
+            matches.append((len(registered_path.parts), candidate))
+    return max(matches, key=lambda item: item[0])[1] if matches else None
 
 
-def cmd_prompt(tier=1):
+def atomic_write(path, content):
+    """Replace a text file atomically, preserving its existing permissions."""
+    mode = path.stat().st_mode if path.exists() else None
+    handle = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False,
+                                         dir=str(path.parent), prefix=".ai-mem-")
+    try:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        if mode is not None:
+            os.chmod(handle.name, mode)
+        os.replace(handle.name, str(path))
+    finally:
+        if not handle.closed:
+            handle.close()
+        if os.path.exists(handle.name):
+            os.unlink(handle.name)
+
+
+@contextmanager
+def current_file_lock(current_file):
+    """Serialize ai-mem lock updates using a stable adjacent lock file."""
+    lock_path = current_file.with_name(current_file.name + ".lock")
+    with open(str(lock_path), "a+") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def file_lock(path):
+    """Serialize a mutable workspace resource through a stable lock inode."""
+    lock_path = path.with_name(path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(lock_path), "a+") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def project_classification(project_md):
+    match = re.search(r"^\s*-\s*Default:\s*`?([a-z-]+)`?\s*$", project_md,
+                      flags=re.IGNORECASE | re.MULTILINE)
+    return match.group(1).lower() if match else "local-only"
+
+
+def approved_cloud_providers(project_md):
+    match = re.search(r"^\s*-\s*Approved cloud providers/models:\s*(.+)$", project_md,
+                      flags=re.IGNORECASE | re.MULTILINE)
+    if not match or match.group(1).strip().lower() in ("", "none", "none until explicitly recorded"):
+        return []
+    return [item.strip().lower() for item in match.group(1).split(",") if item.strip()]
+
+
+def cmd_prompt(tier=1, route="local", provider=None):
     repo_path, commit, branch = get_git_info()
     proj_dir = resolve_project(repo_path)
 
@@ -107,7 +207,7 @@ def cmd_prompt(tier=1):
     if not global_md.exists() and (WORKSPACE / "GLOBAL.md.example").exists():
         global_md = WORKSPACE / "GLOBAL.md.example"
     if global_md.exists():
-        print("\n# Global Environment Rules\n{}".format(global_md.read_text().strip()))
+        print("\n# Global Environment Rules\n{}".format(sanitize_text(global_md.read_text().strip())))
 
     if not proj_dir or not proj_dir.exists():
         print("\n[Notice: Repository {} is not registered in PROJECTS.md]".format(repo_path))
@@ -119,6 +219,21 @@ def cmd_prompt(tier=1):
     current_md = (proj_dir / "CURRENT.md").read_text().strip() if (proj_dir / "CURRENT.md").exists() else ""
     decisions_md = (proj_dir / "DECISIONS.md").read_text().strip() if (proj_dir / "DECISIONS.md").exists() else ""
 
+    classification = project_classification(project_md)
+    if route == "cloud":
+        if classification not in ("public", "cloud-approved"):
+            print("Error: Project classification '{}' cannot be emitted for a cloud route.".format(classification), file=sys.stderr)
+            sys.exit(3)
+        if classification == "cloud-approved":
+            approved = approved_cloud_providers(project_md)
+            if not provider or provider.lower() not in approved:
+                print("Error: Cloud route requires an explicitly approved --provider for this project.", file=sys.stderr)
+                sys.exit(3)
+
+    # Prompt output crosses a model boundary. Redact known credential forms from
+    # every memory document before it leaves this process.
+    project_md, current_md, decisions_md = [sanitize_text(value) for value in
+                                            (project_md, current_md, decisions_md)]
     if tier == 3:  # Fast / Edge (Local 7B/14B)
         print("\n# Active Project: {}\n## Immediate State\n{}".format(proj_dir.name, current_md))
     elif tier == 2:  # Mid-Weight (Local 32B/70B)
@@ -137,13 +252,16 @@ def cmd_save():
         sys.exit(1)
 
     print("--- Session Recording for {} ---".format(proj_dir.name))
-    agent = input("Agent/Tool (e.g. cursor, ollama, claude, aider, script) [agent]: ").strip() or "agent"
-    model = input("Model (e.g. qwen2.5-32b, deepseek-r1, sonnet, gemini) [unknown]: ").strip() or "unknown"
-    task = input("Short task description: ").strip().replace(" ", "-").lower() or "session"
+    try:
+        agent = safe_label(input("Agent/Tool (e.g. cursor, ollama, claude, aider, script) [agent]: "), "agent")
+        model = safe_label(input("Model (e.g. qwen2.5-32b, deepseek-r1, sonnet, gemini) [unknown]: "), "unknown")
+        task = safe_label(input("Short task description: "), "session")
+    except EOFError:
+        print("Error: Session recording cancelled (input closed).", file=sys.stderr)
+        sys.exit(2)
 
     timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     session_id = "{}-{}-{}".format(timestamp, agent, task)
-    session_file = proj_dir / "sessions" / "{}.md".format(session_id)
 
     template = """---
 project: {project}
@@ -183,9 +301,21 @@ status: completed
         title=task.replace("-", " ").title(),
     )
 
-    proj_dir.joinpath("sessions").mkdir(parents=True, exist_ok=True)
+    sessions_dir = proj_dir.joinpath("sessions")
+    sessions_dir.mkdir(parents=True, exist_ok=True)
     clean_template = sanitize_text(template)
-    session_file.write_text(clean_template)
+    with file_lock(sessions_dir):
+        suffix = 0
+        while True:
+            filename = "{}.md".format(session_id if suffix == 0 else "{}-{}".format(session_id, suffix))
+            session_file = sessions_dir / filename
+            try:
+                fd = os.open(str(session_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w") as handle:
+                    handle.write(clean_template)
+                break
+            except FileExistsError:
+                suffix += 1
     print("\n✅ Session handoff drafted: {}".format(session_file))
     print("👉 Edit this file to record details, and update {}/CURRENT.md".format(proj_dir))
 
@@ -245,6 +375,9 @@ def cmd_compact(keep=5):
     if not proj_dir:
         print("Error: Must be in a registered repository.")
         sys.exit(1)
+    if keep < 0:
+        print("Error: --keep must be zero or greater.", file=sys.stderr)
+        sys.exit(2)
 
     sessions_dir = proj_dir / "sessions"
     archive_dir = sessions_dir / "archive"
@@ -252,17 +385,21 @@ def cmd_compact(keep=5):
         print("No sessions directory found.")
         return
 
-    all_sessions = sorted(sessions_dir.glob("*.md"), reverse=True)
-    if len(all_sessions) <= keep:
-        print("✅ Session count ({}) <= threshold ({}). No compaction needed.".format(len(all_sessions), keep))
-        return
-
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    archived_count = 0
-    for sfile in all_sessions[keep:]:
-        dst = archive_dir / sfile.name
-        sfile.rename(dst)
-        archived_count += 1
+    with file_lock(sessions_dir):
+        all_sessions = sorted(sessions_dir.glob("*.md"), reverse=True)
+        if len(all_sessions) <= keep:
+            print("✅ Session count ({}) <= threshold ({}). No compaction needed.".format(len(all_sessions), keep))
+            return
+        to_archive = all_sessions[keep:]
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        collisions = [str(archive_dir / item.name) for item in to_archive if (archive_dir / item.name).exists()]
+        if collisions:
+            print("Error: Refusing compaction because archive targets already exist: {}".format(
+                ", ".join(collisions)), file=sys.stderr)
+            sys.exit(1)
+        for sfile in to_archive:
+            os.replace(str(sfile), str(archive_dir / sfile.name))
+        archived_count = len(to_archive)
 
     print("==========================================================")
     print("              AI-Workspace Memory Compaction              ")
@@ -274,8 +411,8 @@ def cmd_compact(keep=5):
     print("==========================================================")
 
 
-def cmd_lock(workstream, agent="agent", scope="active work"):
-    """Inspired by jumbocontext: register active workstream to prevent multi-agent collision."""
+def cmd_lock(workstream, agent=None, scope="active work"):
+    """Register a workstream without corrupting the CURRENT.md lock table."""
     repo_path, commit, branch = get_git_info()
     proj_dir = resolve_project(repo_path)
     if not proj_dir:
@@ -287,28 +424,54 @@ def cmd_lock(workstream, agent="agent", scope="active work"):
         print("Error: CURRENT.md not found in {}".format(proj_dir))
         sys.exit(1)
 
-    content = current_file.read_text()
-    lock_entry = "| {} | {} | {} | {} | {} | In-Progress |\n".format(
-        workstream, datetime.date.today().isoformat(), agent, branch, scope
+    if not workstream.strip() or "|" in workstream or "\n" in workstream:
+        print("Error: Workstream must be non-empty and cannot contain '|' or a newline.")
+        sys.exit(2)
+
+    owner = agent or default_owner()
+    if any(value in owner for value in ("|", "\n")) or any(value in scope for value in ("|", "\n")):
+        print("Error: Lock owner and scope cannot contain '|' or a newline.")
+        sys.exit(2)
+    lock_entry = "| {} | — | {} | {} | {} | In-Progress |\n".format(
+        workstream.strip(), owner, branch or "detached", scope
     )
+    with current_file_lock(current_file):
+        lines = current_file.read_text().splitlines(True)
+        rows = [line.strip().split("|")[1:-1] for line in lines if line.strip().startswith("|")]
+        if any(len(row) == 6 and row[0].strip() == workstream.strip() for row in rows):
+            print("⚠️  Workstream '{}' is already registered in CURRENT.md.".format(workstream))
+            sys.exit(1)
 
-    if workstream in content:
-        print("⚠️  Workstream '{}' is already registered in CURRENT.md.".format(workstream))
-        return
-
-    # Check for active workstreams table
-    if "## Active workstreams" in content:
-        content = content.replace("## Active workstreams\n", "## Active workstreams\n" + lock_entry)
-    elif "## Active Workstreams" in content:
-        content = content.replace("## Active Workstreams\n", "## Active Workstreams\n" + lock_entry)
-    else:
-        content += "\n## Active Workstreams\n| Workstream | Date | Agent | Branch | Scope | Status |\n|---|---|---|---|---|---|\n" + lock_entry
-
-    current_file.write_text(content)
+        heading = next((i for i, line in enumerate(lines)
+                        if line.strip().lower() == "## active workstreams"), None)
+        if heading is None:
+            lines.extend(["\n## Active Workstreams\n",
+                          "| Workstream | Session ID | Agent/model | Branch/worktree | Scope | Status |\n",
+                          "|---|---|---|---|---|---|\n"])
+            insert_at = len(lines)
+        else:
+            separator = next((i for i in range(heading + 1, len(lines))
+                              if re.match(r"^\|(?:\s*:?-{3,}:?\s*\|)+\s*$", lines[i].strip())), None)
+            if separator is None:
+                lines[heading + 1:heading + 1] = [
+                    "| Workstream | Session ID | Agent/model | Branch/worktree | Scope | Status |\n",
+                    "|---|---|---|---|---|---|\n",
+                ]
+                insert_at = heading + 3
+            else:
+                insert_at = separator + 1
+        # Remove the template's placeholder row once a real lock is added.
+        lines = [line for line in lines if not (line.strip().startswith("|") and
+                 line.strip().split("|")[1].strip() == "None")]
+        if heading is not None and separator is not None:
+            insert_at = next(i + 1 for i, line in enumerate(lines)
+                             if re.match(r"^\|(?:\s*:?-{3,}:?\s*\|)+\s*$", line.strip()))
+        lines.insert(insert_at, lock_entry)
+        atomic_write(current_file, "".join(lines))
     print("🔒 Concurrency Lock Acquired: Registered '{}' in {}/CURRENT.md".format(workstream, proj_dir.name))
 
 
-def cmd_unlock(workstream):
+def cmd_unlock(workstream, owner=None):
     """Clear active workstream from CURRENT.md."""
     repo_path, _, _ = get_git_info()
     proj_dir = resolve_project(repo_path)
@@ -320,10 +483,27 @@ def cmd_unlock(workstream):
     if not current_file.exists():
         return
 
-    lines = current_file.read_text().splitlines()
-    new_lines = [l for l in lines if not (l.strip().startswith("|") and workstream in l)]
-    current_file.write_text("\n".join(new_lines) + "\n")
-    print("🔓 Concurrency Lock Released: Removed '{}' from {}/CURRENT.md".format(workstream, proj_dir.name))
+    owner = owner or default_owner()
+    with current_file_lock(current_file):
+        lines = current_file.read_text().splitlines(True)
+        new_lines = []
+        removed = False
+        for line in lines:
+            columns = line.strip().split("|")[1:-1] if line.strip().startswith("|") else []
+            if len(columns) == 6 and columns[0].strip() == workstream:
+                if columns[2].strip() != owner:
+                    print("Error: Workstream '{}' belongs to '{}', not '{}'.".format(
+                        workstream, columns[2].strip(), owner), file=sys.stderr)
+                    sys.exit(1)
+                removed = True
+                continue
+            new_lines.append(line)
+        if removed:
+            atomic_write(current_file, "".join(new_lines))
+    if removed:
+        print("🔓 Concurrency Lock Released: Removed '{}' from {}/CURRENT.md".format(workstream, proj_dir.name))
+    else:
+        print("⚠️  No workstream named '{}' was registered in CURRENT.md.".format(workstream))
 
 
 def cmd_map():
@@ -340,17 +520,21 @@ def cmd_map():
     file_summary = {}
     py_symbols = {}
 
-    for root, dirs, files in os.walk(str(repo_path)):
+    for root, dirs, files in os.walk(str(repo_path), followlinks=False):
         dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
         for f in files:
             if f.startswith("."): continue
+            full_path = os.path.join(root, f)
+            if os.path.islink(full_path):
+                continue
             ext = os.path.splitext(f)[1].lower()
             rel_file = os.path.relpath(os.path.join(root, f), str(repo_path))
             file_summary[ext] = file_summary.get(ext, 0) + 1
 
             if ext == ".py":
-                full_path = os.path.join(root, f)
                 try:
+                    if os.path.getsize(full_path) > 1024 * 1024:
+                        continue
                     with open(full_path, "r", encoding="utf-8", errors="ignore") as py_f:
                         tree = ast.parse(py_f.read(), filename=f)
                         classes = [n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
@@ -382,7 +566,10 @@ def cmd_map():
 
     output.append("\n---\n*Generated deterministically by `ai-mem map` (zero LLM token spend, no vector store required).*")
 
-    arch_file.write_text("\n".join(output) + "\n")
+    if arch_file.is_symlink():
+        print("Error: Refusing to write ARCHITECTURE.md through a symlink.", file=sys.stderr)
+        sys.exit(1)
+    atomic_write(arch_file, "\n".join(output) + "\n")
     print("✅ Deterministic Codebase Map written to: {}".format(arch_file))
 
 
@@ -414,33 +601,53 @@ def cmd_status():
 
 def cmd_init(slug):
     repo_path, _, _ = get_git_info()
-    target_dir = WORKSPACE / "projects" / slug
-    if target_dir.exists():
-        print("Error: Memory directory {} already exists.".format(target_dir))
-        sys.exit(1)
-
+    if not SLUG_RE.match(slug):
+        print("Error: Project slug must contain only lowercase letters, digits, and hyphens.")
+        sys.exit(2)
     templates_dir = WORKSPACE / "templates"
-    target_dir.joinpath("sessions").mkdir(parents=True, exist_ok=True)
-
-    for doc in ["PROJECT.md", "CURRENT.md", "DECISIONS.md", "EXPERIMENTS.md"]:
-        src = templates_dir / doc
-        dst = target_dir / doc
-        if src.exists():
+    documents = ["PROJECT.md", "CURRENT.md", "DECISIONS.md", "EXPERIMENTS.md", "ARCHITECTURE.md", "GLOSSARY.md"]
+    missing = [doc for doc in documents if not (templates_dir / doc).is_file()]
+    if missing:
+        print("Error: Required templates are missing: {}".format(", ".join(missing)), file=sys.stderr)
+        sys.exit(1)
+    target_dir = WORKSPACE / "projects" / slug
+    registry_path = WORKSPACE / "PROJECTS.md"
+    with file_lock(registry_path):
+        if target_dir.exists():
+            print("Error: Memory directory {} already exists.".format(target_dir))
+            sys.exit(1)
+        if not registry_path.exists():
+            example = WORKSPACE / "PROJECTS.md.example"
+            if not example.exists():
+                print("Error: PROJECTS.md and PROJECTS.md.example are both missing.")
+                sys.exit(1)
+            atomic_write(registry_path, example.read_text())
+        text = registry_path.read_text()
+        if str(repo_path) in text:
+            print("Error: Repository {} is already registered.".format(repo_path), file=sys.stderr)
+            sys.exit(1)
+        target_dir.joinpath("sessions").mkdir(parents=True, exist_ok=False)
+        for doc in documents:
+            src = templates_dir / doc
+            dst = target_dir / doc
             content = src.read_text()
             content = content.replace("/absolute/path", str(repo_path))
             content = content.replace("YYYY-MM-DD", datetime.date.today().isoformat())
-            dst.write_text(content)
+            atomic_write(dst, content)
 
-    # Register in PROJECTS.md if not already present
-    projects_file = WORKSPACE / "PROJECTS.md"
-    entry = "| {} | {} | projects/{} | Active |\n".format(slug.replace("-", " ").title(), repo_path, slug)
-    if projects_file.exists():
-        text = projects_file.read_text()
-        if str(repo_path) not in text:
-            with open(str(projects_file), "a") as f:
-                f.write(entry)
-            print("✅ Registered {} in {}".format(slug, projects_file))
+        entry = "| {} | {} | projects/{} | Active |\n".format(slug.replace("-", " ").title(), repo_path, slug)
+        atomic_write(registry_path, text.rstrip() + "\n" + entry)
+    print("✅ Registered {} in {}".format(slug, registry_path))
     print("✅ Initialized memory directory: {}".format(target_dir))
+
+
+def write_integration_file(path, content):
+    """Create an integration file without overwriting a user's configuration."""
+    if path.exists():
+        print("⚠️  Skipped existing file (left unchanged): {}".format(path))
+        return False
+    path.write_text(content)
+    return True
 
 
 def cmd_inject(tool):
@@ -450,28 +657,31 @@ def cmd_inject(tool):
         print("Error: Must be in a registered repository to inject tool configurations.")
         sys.exit(1)
 
+    valid_tools = {"cursor", "aider", "claude", "copilot", "all"}
+    if tool not in valid_tools:
+        print("Error: Unknown tool '{}'. Choose cursor, aider, claude, copilot, or all.".format(tool))
+        sys.exit(2)
     tools = ["cursor", "aider", "claude", "copilot"] if tool == "all" else [tool]
 
     if "cursor" in tools:
         rules_dir = repo_path / ".cursor" / "rules"
         rules_dir.mkdir(parents=True, exist_ok=True)
         rule_file = rules_dir / "agent-memory.mdc"
-        rule_file.write_text(
+        if write_integration_file(rule_file,
             "---\ndescription: Agent memory workflow\nglobs: *\n---\n"
             "# Shared Agent Memory\n"
             "Always read `{current_md}` before modifying files.\n"
             "Follow the universal rules in `~/AGENTS.md`.\n"
             "When done, run `ai-mem save` to record the session.\n".format(
                 current_md=proj_dir / "CURRENT.md"
-            )
-        )
-        print("✅ Injected Cursor rule: {}".format(rule_file))
+            )):
+            print("✅ Injected Cursor rule: {}".format(rule_file))
 
     if "aider" in tools:
         aider_conf = repo_path / ".aider.conf.yml"
         content = "read:\n  - ~/AGENTS.md\n  - {}\n".format(proj_dir / "CURRENT.md")
-        aider_conf.write_text(content)
-        print("✅ Injected Aider configuration: {}".format(aider_conf))
+        if write_integration_file(aider_conf, content):
+            print("✅ Injected Aider configuration: {}".format(aider_conf))
 
     if "claude" in tools:
         claude_md = repo_path / "CLAUDE.md"
@@ -480,8 +690,8 @@ def cmd_inject(tool):
             "Follow `~/AGENTS.md` and the memory workflow.\n"
             "Read `{current_md}` before acting.\n"
         ).format(current_md=proj_dir / "CURRENT.md")
-        claude_md.write_text(content)
-        print("✅ Injected Claude entrypoint: {}".format(claude_md))
+        if write_integration_file(claude_md, content):
+            print("✅ Injected Claude entrypoint: {}".format(claude_md))
 
     if "copilot" in tools:
         copilot_dir = repo_path / ".github"
@@ -492,8 +702,8 @@ def cmd_inject(tool):
             "Follow `~/AGENTS.md`.\n"
             "Consult `{current_md}` for active architecture state and ongoing goals.\n"
         ).format(current_md=proj_dir / "CURRENT.md")
-        copilot_file.write_text(content)
-        print("✅ Injected Copilot instructions: {}".format(copilot_file))
+        if write_integration_file(copilot_file, content):
+            print("✅ Injected Copilot instructions: {}".format(copilot_file))
 
 
 def cmd_doctor():
@@ -519,10 +729,11 @@ def cmd_doctor():
         warnings += 1
 
     # 3. Check PROJECTS.md
-    if PROJECTS_FILE.exists():
-        with open(str(PROJECTS_FILE)) as f:
+    registry = projects_file()
+    if registry.exists():
+        with open(str(registry)) as f:
             count = sum(1 for l in f if l.strip().startswith("|") and not l.strip().startswith("| Project") and not l.strip().startswith("|---"))
-        print("✅ Projects registry: {} ({} projects registered)".format(PROJECTS_FILE.name, count))
+        print("✅ Projects registry: {} ({} projects registered)".format(registry.name, count))
     else:
         print("❌ PROJECTS.md missing in {}".format(WORKSPACE))
         errors += 1
@@ -552,50 +763,70 @@ def cmd_doctor():
     print("==========================================================")
 
 
-if __name__ == "__main__":
-    args = sys.argv[1:]
-    if not args or args[0] == "prompt":
-        tier = 1
-        if "--tier" in args:
-            idx = args.index("--tier")
-            if idx + 1 < len(args):
-                tier = int(args[idx + 1])
-        cmd_prompt(tier)
-    elif args[0] == "status":
+def non_negative(value):
+    try:
+        result = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be an integer")
+    if result < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return result
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="ai-mem")
+    sub = parser.add_subparsers(dest="command")
+    prompt = sub.add_parser("prompt")
+    prompt.add_argument("--tier", type=int, choices=(1, 2, 3), default=1)
+    prompt.add_argument("--route", choices=("local", "cloud"), default="local")
+    prompt.add_argument("--provider", help="provider name, required for cloud-approved projects")
+    sub.add_parser("status")
+    sub.add_parser("save")
+    log = sub.add_parser("log")
+    log.add_argument("-n", type=non_negative, default=5)
+    sub.add_parser("map")
+    lock = sub.add_parser("lock")
+    lock.add_argument("workstream")
+    lock.add_argument("--owner")
+    lock.add_argument("--scope", default="active work")
+    unlock = sub.add_parser("unlock")
+    unlock.add_argument("workstream")
+    unlock.add_argument("--owner")
+    compact = sub.add_parser("compact")
+    compact.add_argument("--keep", type=non_negative, default=5)
+    init = sub.add_parser("init")
+    init.add_argument("slug")
+    inject = sub.add_parser("inject")
+    inject.add_argument("tool", choices=("cursor", "aider", "claude", "copilot", "all"), default="all", nargs="?")
+    sub.add_parser("doctor")
+    parsed = parser.parse_args(argv)
+    if parsed.command is None:
+        parser.print_help(sys.stderr)
+        return 2
+    if parsed.command == "prompt":
+        cmd_prompt(parsed.tier, parsed.route, parsed.provider)
+    elif parsed.command == "status":
         cmd_status()
-    elif args[0] == "save":
+    elif parsed.command == "save":
         cmd_save()
-    elif args[0] == "log":
-        n = 5
-        if "-n" in args:
-            idx = args.index("-n")
-            if idx + 1 < len(args):
-                n = int(args[idx + 1])
-        cmd_log(n)
-    elif args[0] == "map":
+    elif parsed.command == "log":
+        cmd_log(parsed.n)
+    elif parsed.command == "map":
         cmd_map()
-    elif args[0] == "lock":
-        ws = args[1] if len(args) > 1 else "active-session"
-        cmd_lock(ws)
-    elif args[0] == "unlock":
-        ws = args[1] if len(args) > 1 else "active-session"
-        cmd_unlock(ws)
-    elif args[0] == "compact":
-        k = 5
-        if "--keep" in args:
-            idx = args.index("--keep")
-            if idx + 1 < len(args):
-                k = int(args[idx + 1])
-        cmd_compact(k)
-    elif args[0] == "init":
-        if len(args) < 2:
-            print("Usage: ai-mem init <project-slug>")
-            sys.exit(1)
-        cmd_init(args[1])
-    elif args[0] == "inject":
-        tool = args[1] if len(args) > 1 else "all"
-        cmd_inject(tool)
-    elif args[0] == "doctor":
+    elif parsed.command == "lock":
+        cmd_lock(parsed.workstream, parsed.owner, parsed.scope)
+    elif parsed.command == "unlock":
+        cmd_unlock(parsed.workstream, parsed.owner)
+    elif parsed.command == "compact":
+        cmd_compact(parsed.keep)
+    elif parsed.command == "init":
+        cmd_init(parsed.slug)
+    elif parsed.command == "inject":
+        cmd_inject(parsed.tool)
+    elif parsed.command == "doctor":
         cmd_doctor()
-    else:
-        print("Usage: ai-mem [status | prompt [--tier 1|2|3] | save | log [-n N] | map | lock <name> | unlock <name> | compact [--keep N] | init <slug> | inject <tool> | doctor]")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

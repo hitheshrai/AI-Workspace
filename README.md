@@ -127,6 +127,9 @@ Or configure specific tools individually:
 * `ai-mem inject claude` &rarr; Generates `CLAUDE.md`
 * `ai-mem inject copilot` &rarr; Generates `.github/copilot-instructions.md`
 
+`inject` never overwrites an existing integration file. Review or merge an
+existing configuration manually before rerunning it.
+
 ---
 
 ### 3. Scan & Map Codebase Architecture (Zero Token Spend)
@@ -147,7 +150,11 @@ ai-mem lock "refactor-auth"
 # Release lock when complete
 ai-mem unlock "refactor-auth"
 ```
-*Locks are visibly tracked in `CURRENT.md` under `## Active Workstreams`.*
+*Locks are visibly tracked in `CURRENT.md` under `## Active Workstreams`.
+Updates use an advisory file lock and atomic replacement, so concurrent
+`ai-mem` clients on the same shared filesystem do not lose one another's
+entries. Agents must still acquire a lock before editing for this convention to
+prevent collisions.*
 
 ---
 
@@ -171,6 +178,14 @@ ai-mem prompt --tier 1
 
 # Tier 3: Edge & Fast Models (7B / 14B: Compact Immediate State < 500 Tokens)
 (ai-mem prompt --tier 3 && echo "Task: write unit tests") | ollama run deepseek-coder:6.7b
+```
+
+For a cloud-bound context packet, name the route explicitly. `local-only` and
+unknown projects are rejected; `cloud-approved` projects must name a provider
+listed in their `PROJECT.md`.
+
+```bash
+ai-mem prompt --route cloud --provider approved-provider
 ```
 
 ---
@@ -223,7 +238,7 @@ ai-mem compact --keep 5
 | `ai-mem map` | — | Deterministic AST codebase scanner generating `ARCHITECTURE.md` (0 tokens). |
 | `ai-mem lock` | `<workstream>` | Registers active lock in `CURRENT.md` to prevent multi-agent collision. |
 | `ai-mem unlock` | `<workstream>` | Releases workstream lock from `CURRENT.md`. |
-| `ai-mem prompt` | `[--tier 1\|2\|3]` | Generates tiered prompt context for piping into local or cloud LLMs. |
+| `ai-mem prompt` | `[--tier 1\|2\|3] [--route local\|cloud] [--provider NAME]` | Generates tiered prompt context. Cloud routes enforce the recorded classification. |
 | `ai-mem log` | `[-n N]` | Displays formatted terminal timeline of the last $N$ agent sessions. |
 | `ai-mem save` | — | Interactively records an immutable session handoff record. |
 | `ai-mem compact` | `[--keep N]` | Moves older sessions to `sessions/archive/` to mitigate context rot. |
@@ -268,7 +283,7 @@ ai-mem compact --keep 5
 
 1. **Air-Gapped Data Safety**: All private project memory (`projects/`), raw data, logs, and machine environments (`GLOBAL.md`, `PROJECTS.md`) are strictly `.gitignore`d. Only the portable tooling, installer, and templates are tracked in Git.
 2. **Data Classification**: Every project defines its classification in `PROJECT.md` (`public`, `internal`, or `restricted-confidential`). Tasks marked `local-only` fail closed—they will never fall back to a cloud model.
-3. **Secret Sanitization**: `ai-mem save` includes a built-in privacy filter that actively scans for API keys, passwords, and tokens before writing session handoffs.
+3. **Secret Sanitization**: `ai-mem save` and `ai-mem prompt` apply a built-in, pattern-based filter to known API keys, passwords, tokens, private keys, and credential URLs. This is defense in depth, not a substitute for keeping sensitive content out of cloud prompts.
 
 ---
 

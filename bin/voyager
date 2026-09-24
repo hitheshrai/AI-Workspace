@@ -1,7 +1,4 @@
-#!/home/hraipuru/mambaforge/bin/python
-# System python3 on this login node is 3.6 (argparse lacks subparsers
-# `required=`); use the Mambaforge 3.10 interpreter, per AI-Workspace/pilot
-# convention.
+#!/usr/bin/env python3
 """ASU RC Voyager (openai.rc.asu.edu) LLM gateway client.
 
 Purpose: offload token-cheap, non-sensitive work (bulk text processing,
@@ -143,7 +140,8 @@ def main():
     parser = argparse.ArgumentParser(
         prog="voyager", description="ASU RC Voyager LLM gateway CLI"
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    # Keep this compatible with the documented Python 3.6+ baseline.
+    sub = parser.add_subparsers(dest="command")
 
     p_models = sub.add_parser("models", help="list available model ids")
     p_models.set_defaults(func=cmd_models)
@@ -171,8 +169,12 @@ def main():
     p_chat.set_defaults(func=cmd_chat)
 
     args = parser.parse_args()
+    if args.command is None:
+        parser.print_help(sys.stderr)
+        return 2
     args.func(args)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

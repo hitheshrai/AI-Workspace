@@ -22,14 +22,14 @@ else
 fi
 
 # 2. Initialize local configuration files if missing
-if [[ ! -f "$WORKSPACE_DIR/GLOBAL.md" ]]; then
+if [[ ! -e "$WORKSPACE_DIR/GLOBAL.md" && ! -L "$WORKSPACE_DIR/GLOBAL.md" ]]; then
   cp "$WORKSPACE_DIR/GLOBAL.md.example" "$WORKSPACE_DIR/GLOBAL.md"
   echo "✅ Initialized GLOBAL.md from template"
 else
   echo "ℹ️  GLOBAL.md already exists (preserved)"
 fi
 
-if [[ ! -f "$WORKSPACE_DIR/PROJECTS.md" ]]; then
+if [[ ! -e "$WORKSPACE_DIR/PROJECTS.md" && ! -L "$WORKSPACE_DIR/PROJECTS.md" ]]; then
   cp "$WORKSPACE_DIR/PROJECTS.md.example" "$WORKSPACE_DIR/PROJECTS.md"
   echo "✅ Initialized PROJECTS.md from template"
 else
@@ -37,7 +37,7 @@ else
 fi
 
 # 3. Setup home directory universal agent instructions
-if [[ ! -f "$HOME/AGENTS.md" ]]; then
+if [[ ! -e "$HOME/AGENTS.md" && ! -L "$HOME/AGENTS.md" ]]; then
   cp "$WORKSPACE_DIR/templates/AGENTS.md" "$HOME/AGENTS.md"
   echo "✅ Installed universal ~/AGENTS.md"
 else
@@ -49,9 +49,18 @@ mkdir -p "$BIN_DIR"
 
 chmod +x "$WORKSPACE_DIR/bin/ai-mem" "$WORKSPACE_DIR/bin/init-project-memory"
 
-ln -sf "$WORKSPACE_DIR/bin/ai-mem" "$BIN_DIR/ai-mem"
-ln -sf "$WORKSPACE_DIR/bin/init-project-memory" "$BIN_DIR/init-project-memory"
-echo "✅ Linked ai-mem and init-project-memory to $BIN_DIR"
+for command in ai-mem init-project-memory; do
+  target="$BIN_DIR/$command"
+  source="$WORKSPACE_DIR/bin/$command"
+  if [[ -L "$target" && "$(readlink "$target")" == "$source" ]]; then
+    echo "ℹ️  $target already points to this workspace (preserved)"
+  elif [[ -e "$target" || -L "$target" ]]; then
+    echo "⚠️  Existing $target preserved; add or update the link manually."
+  else
+    ln -s "$source" "$target"
+    echo "✅ Linked $command to $BIN_DIR"
+  fi
+done
 
 # 5. Check PATH
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
